@@ -1,0 +1,334 @@
+# fx_event_engine.py — EURUSD synthetic event engine (IV-bound fade/follow)
+# Part 1/2
+
+import os
+import math
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+import numpy as np
+import pandas as pd
+
+# ==========================================
+# CONFIG
+# ==========================================
+
+OUTPUT_DIR = "/Users/williamnelson/Downloads/fx_event_engine_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+PAIR = "EURUSD"                 # single-pair synthetic
+N_EVENTS = 300                  # total synthetic macro events
+TRAIN_SPLIT = 0.70              # 70% train / 30% validation (chronological)
+ROLLING_SHARPE_WINDOW = 10      # trades
+TRADES_PER_YEAR = 220           # for annualised Sharpe scaling
+
+# Event mechanics
+EM_WINDOW_SECONDS = 45          # IV boundary window (entry horizon)
+EXIT_WINDOW_SECONDS = 180       # exit horizon (used in simulator)
+SECONDS_PER_YEAR = 365 * 24 * 3600
+
+# Realistic EURUSD IV band (annualised)
+IV_MEAN = 0.10                  # 10% annualised ATM-ish
+IV_STD  = 0.02                  # variability per event
+IV_MIN, IV_MAX = 0.05, 0.16
+
+# Price baseline
+SPOT0 = 1.1000                  # starting anchor level
+SPOT_DRIFT_STD = 0.0005         # slow drift in spot across events (fractional)
+
+# Surprise model (structured fat tails)
+# Probabilities: 70% small, 25% medium, 5% large
+SURPRISE_P = (0.70, 0.25, 0.05)
+SURPRISE_SIGMAS = (0.5, 1.0, 2.5)  # standard deviations for z-scores
+
+# Overshoot probabilities (stop runs / flow bursts)
+OVERSHOOT_P_SMALL  = 0.40
+OVERSHOOT_P_MEDIUM = 0.25
+OVERSHOOT_P_LARGE  = 0.12
+
+# Grid for training-time tuning
+GRID = {
+    "k": [1.3, 1.5, 1.7],          # IV multiple to trigger
+    "k_extreme": [2.2, 2.5, 3.0],  # extreme threshold
+    "z_thr": [0.5, 0.7, 1.0],      # surprise significance
+    "tp_frac": [0.5, 0.7, 0.9],    # take-profit fraction of EM (for FADE)
+}
+
+rng = np.random.default_rng(42)
+
+# ==========================================
+# DATACLASS
+# ==========================================
+
+@dataclass
+class EventRow:
+    t: pd.Timestamp
+    pair: str
+    spot_anchor: float
+    iv_ann: float
+    surprise_z: float
+    move_45s: float
+    move_180s: float
+
+# ==========================================
+# CORE MATH
+# ==========================================
+
+def expected_move_from_iv(spot: float, iv_ann: float, seconds: int = EM_WINDOW_SECONDS) -> float:
+    """Convert annualised IV to expected absolute price move for a short horizon."""
+    T = seconds / SECONDS_PER_YEAR
+    return spot * iv_ann * math.sqrt(T)
+
+def annualised_sharpe(returns_bps: pd.Series, trades_per_year: float = TRADES_PER_YEAR) -> float:
+    if len(returns_bps) < 2:
+        return 0.0
+    mu = float(returns_bps.mean())
+    sd = float(returns_bps.std(ddof=1))
+    if sd == 0:
+        return 0.0
+    return (mu * trades_per_year) / (sd * math.sqrt(trades_per_year))
+
+def equity_and_mdd(returns_bps: pd.Series) -> Tuple[pd.Series, float]:
+    eq = returns_bps.cumsum()
+    roll_max = eq.cummax()
+    dd = roll_max - eq
+    mdd = float(dd.max()) if len(dd) else 0.0
+    return eq, mdd
+
+# ==========================================
+# SYNTHETIC GENERATOR (REALISTIC EURUSD)
+# ==========================================
+
+def draw_surprise_z() -> float:
+    """Structured fat-tailed surprise z-score."""
+    u = rng.random()
+    if u < SURPRISE_P[0]:    # small
+        sigma = SURPRISE_SIGMAS[0]
+    elif u < SURPRISE_P[0] + SURPRISE_P[1]:  # medium
+        sigma = SURPRISE_SIGMAS[1]
+    else:                    # large
+        sigma = SURPRISE_SIGMAS[2]
+    return float(rng.normal(0.0, sigma))
+
+def overshoot_probability(abs_z: float) -> float:
+    """Overshoot chance depends on surprise size: small > medium > large."""
+    if abs_z < 0.5:
+        return OVERSHOOT_P_SMALL
+    elif abs_z < 1.5:
+        return OVERSHOOT_P_MEDIUM
+    else:
+        return OVERSHOOT_P_LARGE
+
+def clip(value: float, lo: float, hi: float) -> float:
+    return float(max(lo, min(hi, value)))
+
+def generate_synthetic_events(n_events: int = N_EVENTS) -> List[EventRow]:
+    rows: List[EventRow] = []
+    spot = SPOT0
+    t0 = pd.Timestamp("2023-01-01 13:30:00")
+
+    for i in range(n_events):
+        # Timestamp spaced roughly weekly (macro cadence), jittered
+        t = t0 + pd.Timedelta(days=7 * i) + pd.Timedelta(minutes=int(rng.normal(0, 20)))
+
+        # IV draw
+        iv = clip(float(rng.normal(IV_MEAN, IV_STD)), IV_MIN, IV_MAX)
+
+        # Surprise
+        z = draw_surprise_z()
+        abs_z = abs(z)
+
+        # Expected move at 45s
+        EM = expected_move_from_iv(spot, iv, EM_WINDOW_SECONDS)
+
+        # Direction: positive z -> USD strength (e.g., hot CPI) -> EURUSD down
+        # So EURUSD signed move is typically -sign(z)
+        base_sign = -np.sign(z) if z != 0 else rng.choice([-1, 1])
+
+        # Magnitude scaling: baseline (0.9..1.3)*EM plus z-driven component
+        # small z -> ~1.0*EM; medium -> 1.2*EM; large -> 1.6*EM on average
+        if abs_z < 0.5:
+            mag_mult = rng.uniform(0.7, 1.2)
+        elif abs_z < 1.5:
+            mag_mult = rng.uniform(1.0, 1.5)
+        else:
+            mag_mult = rng.uniform(1.2, 2.0)
+
+        move_45 = base_sign * mag_mult * EM
+
+        # Overshoot (stop run) occasionally adds big wick in either direction
+        if rng.random() < overshoot_probability(abs_z):
+            move_45 += rng.choice([-1, 1]) * EM * rng.uniform(0.6, 1.6)
+
+        # 180s evolution: partial mean-reversion for small surprises; persistence for large
+        if abs_z < 0.5:
+            mean_rev = rng.uniform(0.35, 0.55)
+            move_180 = move_45 * (1 - mean_rev) + rng.normal(0, EM * 0.15)
+        elif abs_z < 1.5:
+            mean_rev = rng.uniform(0.15, 0.35)
+            move_180 = move_45 * (1 - mean_rev) + rng.normal(0, EM * 0.18)
+        else:
+            # strong trend, small mean-reversion
+            mean_rev = rng.uniform(0.0, 0.20)
+            # allow momentum continuation a bit
+            cont = rng.uniform(0.0, 0.4)
+            move_180 = move_45 * (1 - mean_rev + cont) + rng.normal(0, EM * 0.20)
+
+        rows.append(EventRow(
+            t=t, pair=PAIR, spot_anchor=spot, iv_ann=iv,
+            surprise_z=z, move_45s=float(move_45), move_180s=float(move_180)
+        ))
+
+        # Slow drift in spot level from event to event
+        spot *= (1 + rng.normal(0.0, SPOT_DRIFT_STD))
+
+    return rows
+
+# ==========================================
+# SIGNAL + SIM
+# ==========================================
+
+def decide_signal(move_45s: float, EM: float, z: float,
+                  k: float, k_extreme: float, z_thr: float):
+    """
+    Returns (action, direction) or None.
+      action: 'FADE' or 'FOLLOW'
+      direction: +1 buy EURUSD, -1 sell EURUSD (direction of the position)
+    """
+    if EM <= 0:
+        return None
+    breach = abs(move_45s) / EM
+    if breach < 1.0:
+        return None
+    # Extreme overreaction -> fade if surprise is small
+    if breach >= k_extreme and abs(z) < z_thr:
+        return ("FADE", -1 if move_45s > 0 else 1)
+    # Significant macro shock -> follow
+    if breach >= k and abs(z) >= z_thr:
+        return ("FOLLOW", 1 if move_45s > 0 else -1)
+    # Regular overreaction -> fade if above k and surprise small-ish
+    if breach >= k and abs(z) < z_thr:
+        return ("FADE", -1 if move_45s > 0 else 1)
+    return None
+
+def simulate_trade(anchor: float, move45: float, move180: float,
+                   EM: float, action: str, direction: int, tp_frac: float) -> float:
+    """
+    Heuristic execution model:
+      - Entry at ~anchor + move45
+      - For FADE: target back by tp_frac*EM towards anchor
+      - For FOLLOW: target extend by 0.5*EM in move direction
+      - If target not 'closer' than terminal (anchor+move180), exit at terminal.
+      - Returns pnl in bps relative to anchor.
+    """
+    entry = anchor + move45
+    if action == "FADE":
+        target = entry - direction * EM * tp_frac
+    else:  # FOLLOW
+        target = entry + direction * EM * 0.5
+
+    terminal = anchor + move180
+    # Choose whichever exit is "closer" to entry, crude but consistent with our synthetic path
+    exit_px = target if abs(target - entry) < abs(terminal - entry) else terminal
+    pnl_price = (exit_px - entry) * direction
+    pnl_bps = (pnl_price / anchor) * 1e4
+    return float(pnl_bps)
+
+# ==========================================
+# DATAFRAMES + RUNNERS (will complete in Part 2)
+# ==========================================
+
+def to_dataframe(events: List[EventRow]) -> pd.DataFrame:
+    return pd.DataFrame([e.__dict__ for e in events]).sort_values("t").reset_index(drop=True)
+
+# ==========================================
+# STRATEGY RUNNER
+# ==========================================
+
+def run_strategy(df: pd.DataFrame, params: Dict) -> pd.Series:
+    pnl = []
+    for _, row in df.iterrows():
+        EM = expected_move_from_iv(row.spot_anchor, row.iv_ann)
+        sig = decide_signal(row.move_45s, EM, row.surprise_z,
+                            params["k"], params["k_extreme"], params["z_thr"])
+        if not sig:
+            continue
+        action, direction = sig
+        trade_pnl = simulate_trade(row.spot_anchor, row.move_45s, row.move_180s,
+                                   EM, action, direction, params["tp_frac"])
+        pnl.append(trade_pnl)
+    return pd.Series(pnl)
+
+
+# ==========================================
+# TRAIN/VALIDATION SPLIT
+# ==========================================
+
+def train_val_split(df: pd.DataFrame, split: float = TRAIN_SPLIT):
+    split_idx = int(len(df) * split)
+    train = df.iloc[:split_idx].copy()
+    val = df.iloc[split_idx:].copy()
+    return train, val
+
+
+# ==========================================
+# GRID SEARCH (TRAIN ONLY)
+# ==========================================
+
+def grid_search(train_df: pd.DataFrame):
+    best_params = None
+    best_score = -1e9
+    for k in GRID["k"]:
+        for kx in GRID["k_extreme"]:
+            for zthr in GRID["z_thr"]:
+                for tp in GRID["tp_frac"]:
+                    params = {"k": k, "k_extreme": kx, "z_thr": zthr, "tp_frac": tp}
+                    pnl = run_strategy(train_df, params)
+                    score = annualised_sharpe(pnl)
+                    if score > best_score:
+                        best_score = score
+                        best_params = params
+    return best_params
+
+# ==========================================
+# MAIN EXECUTION
+# ==========================================
+
+def main():
+    print("✅ Generating realistic synthetic EURUSD event dataset...")
+    events = generate_synthetic_events(N_EVENTS)
+    df = to_dataframe(events)
+    print(f"✅ Generated {len(df)} events")
+
+    print("✅ Splitting into Train/Validation sets...")
+    train_df, val_df = train_val_split(df)
+    print(f"   Train events: {len(train_df)}, Validation events: {len(val_df)}")
+
+    print("\n🎯 Running parameter tuning (train set only)...")
+    best_params = grid_search(train_df)
+    print(f"✅ Best parameters: {best_params}")
+
+    print("\n🚀 Running strategy on validation set ONLY...")
+    val_pnl = run_strategy(val_df, best_params)
+    equity, max_dd = equity_and_mdd(val_pnl)
+    rolling_sharpe = val_pnl.rolling(ROLLING_SHARPE_WINDOW).mean() / val_pnl.rolling(ROLLING_SHARPE_WINDOW).std()
+
+    print("\n===== VALIDATION RESULTS =====")
+    print(f"Total Trades:           {len(val_pnl)}")
+    print(f"Annualised Sharpe:      {annualised_sharpe(val_pnl):.3f}")
+    print(f"Max Drawdown (bps):     {max_dd:.2f}")
+    print(f"Rolling Sharpe (10tr):  min={rolling_sharpe.min():.3f}, max={rolling_sharpe.max():.3f}")
+
+    print(f"\n📁 Saving outputs to: {OUTPUT_DIR}")
+    val_pnl.to_csv(os.path.join(OUTPUT_DIR, "validation_pnl.csv"), index=False)
+    equity.to_csv(os.path.join(OUTPUT_DIR, "equity_curve.csv"), index=False)
+    with open(os.path.join(OUTPUT_DIR, "best_params.txt"), "w") as f:
+        f.write(str(best_params))
+
+    print("\n✅ Done.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
