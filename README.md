@@ -82,3 +82,10 @@ It’s synthetic, but **structurally accurate** and **useful for modelling resea
 - No volatility regime filter  
 - No position sizing logic yet  
 
+
+So:
+System activates when event realised vol exceeds IV.
+If surprise is statistically small (according to standard normal dist of previous event surprises) -> mean-revert to IV bound
+If surprise is statistically large (according to standard normal dist of previous event suprises) -> follow the move for 180s
+
+If event realised vol does not exceed IV, then system is inactive.
